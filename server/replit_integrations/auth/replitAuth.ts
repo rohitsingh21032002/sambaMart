@@ -26,7 +26,8 @@ const getOidcClient = memoize(
     const clientSecret = process.env.AUTH_CLIENT_SECRET ?? process.env.REPL_SECRET;
 
     if (!clientId) {
-      throw new Error("AUTH_CLIENT_ID (or REPL_ID) must be set to enable auth");
+      // No client id provided — return null to indicate auth is disabled.
+      return null;
     }
 
     // Create a client instance for use with passport strategy
@@ -39,6 +40,9 @@ const getOidcClient = memoize(
   },
   { maxAge: 3600 * 1000 }
 );
+
+// Helper to check if auth is enabled (supports REPL_ID legacy var)
+const isAuthEnabled = () => Boolean(process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID);
 
 export function getSession() {
   const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
@@ -91,8 +95,7 @@ async function upsertUser(claims: any) {
 
 export async function setupAuth(app: Express) {
   // If auth is not configured, skip setup
-  const hasClientId = Boolean(process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID);
-  if (!hasClientId) {
+  if (!isAuthEnabled()) {
     console.warn('Auth client id not set; skipping auth setup');
     return;
   }
@@ -102,7 +105,12 @@ export async function setupAuth(app: Express) {
   app.use(passport.initialize());
   app.use(passport.session());
 
-  const { provider, client: oidcClient } = await getOidcClient();
+  const oidc = await getOidcClient();
+  if (!oidc) {
+    console.warn('Auth client id not set; skipping auth setup');
+    return;
+  }
+  const { provider, client: oidcClient } = oidc;
 
   const verify: VerifyFunction = async (
     tokens: client.TokenEndpointResponse & client.TokenEndpointResponseHelpers,
@@ -181,9 +189,14 @@ export async function setupAuth(app: Express) {
 }
 
 export const isAuthenticated: RequestHandler = async (req, res, next) => {
+  // If auth is disabled, allow all requests (MVP mode)
+  if (!isAuthEnabled()) {
+    return next();
+  }
+
   const user = req.user as any;
 
-  if (!req.isAuthenticated() || !user.expires_at) {
+  if (!req.isAuthenticated() || !user?.expires_at) {
     return res.status(401).json({ message: "Unauthorized" });
   }
 
@@ -192,19 +205,25 @@ export const isAuthenticated: RequestHandler = async (req, res, next) => {
     return next();
   }
 
-  const refreshToken = user.refresh_token;
-  if (!refreshToken) {
-    res.status(401).json({ message: "Unauthorized" });
-    return;
+  if (!user.refresh_token) {
+    return res.status(401).json({ message: "Unauthorized" });
   }
 
   try {
-    const { client: oidcClient } = await getOidcClient();
-    const tokenResponse = await client.refreshTokenGrant(oidcClient as any, refreshToken);
+    const oidc = await getOidcClient();
+    if (!oidc) {
+      // Auth became disabled; allow through in fallback mode
+      return next();
+    }
+
+    const tokenResponse = await client.refreshTokenGrant(
+      oidc.client as any,
+      user.refresh_token
+    );
+
     updateUserSession(user, tokenResponse as any);
     return next();
   } catch (error) {
-    res.status(401).json({ message: "Unauthorized" });
-    return;
+    return res.status(401).json({ message: "Unauthorized" });
   }
 };
