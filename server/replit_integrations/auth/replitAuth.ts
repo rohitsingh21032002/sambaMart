@@ -10,25 +10,23 @@ import { authStorage } from "./storage";
 
 const getOidcClient = memoize(
   async () => {
-    const provider = process.env.AUTH_PROVIDER ?? (process.env.REPL_ID ? "replit" : "none");
-    if (provider === "none") {
-      throw new Error("No auth provider configured");
+    // Support either old REPL_ID env var or new provider-agnostic vars
+    const clientId = process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID;
+    const clientSecret = process.env.AUTH_CLIENT_SECRET ?? process.env.REPL_SECRET;
+
+    // If no client id is configured, don't run discovery — return null to indicate auth is disabled.
+    if (!clientId) {
+      return null;
     }
+
+    // Determine provider, prefer explicit AUTH_PROVIDER, otherwise infer
+    const provider = process.env.AUTH_PROVIDER ?? (process.env.REPL_ID ? "replit" : process.env.AUTH_CLIENT_ID ? "google" : "none");
 
     const defaultIssuer = provider === "google" ? "https://accounts.google.com" : "https://replit.com/oidc";
     const issuerUrl = new URL(process.env.ISSUER_URL ?? defaultIssuer);
 
     // Discover issuer metadata
     const issuer = await client.discovery(issuerUrl);
-
-    // Support either old REPL_ID env var or new provider-agnostic vars
-    const clientId = process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID;
-    const clientSecret = process.env.AUTH_CLIENT_SECRET ?? process.env.REPL_SECRET;
-
-    if (!clientId) {
-      // No client id provided — return null to indicate auth is disabled.
-      return null;
-    }
 
     // Create a client instance for use with passport strategy
     const oidcClient = new issuer.Client({
@@ -42,7 +40,14 @@ const getOidcClient = memoize(
 );
 
 // Helper to check if auth is enabled (supports REPL_ID legacy var)
-const isAuthEnabled = () => Boolean(process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID);
+export const isAuthEnabled = () => Boolean(process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID);
+
+// Returns a small auth status object for logging/health checks
+export const getAuthStatus = () => {
+  const authEnabled = isAuthEnabled();
+  const provider = authEnabled ? (process.env.AUTH_PROVIDER ?? (process.env.REPL_ID ? 'replit' : 'google')) : null;
+  return { authEnabled, provider } as const;
+};
 
 export function getSession() {
   const sessionTtl = 7 * 24 * 60 * 60 * 1000; // 1 week
@@ -94,6 +99,10 @@ async function upsertUser(claims: any) {
 }
 
 export async function setupAuth(app: Express) {
+  // Log auth status at startup for easier deploy diagnostics
+  const authStatus = getAuthStatus();
+  console.log(`Auth: ${authStatus.authEnabled ? 'enabled' : 'disabled'}${authStatus.authEnabled ? ` (provider=${authStatus.provider})` : ''}`);
+
   // If auth is not configured, skip setup
   if (!isAuthEnabled()) {
     console.warn('Auth client id not set; skipping auth setup');
