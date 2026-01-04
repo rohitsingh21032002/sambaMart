@@ -103,6 +103,16 @@ export async function registerRoutes(
     }
   });
 
+  // Health
+  app.get('/api/health', async (req, res) => {
+    try {
+      const { getAuthStatus } = await import('./replit_integrations/auth');
+      res.json({ status: 'ok', auth: getAuthStatus() });
+    } catch (e) {
+      res.json({ status: 'ok', auth: { authEnabled: false, provider: null } });
+    }
+  });
+
   // Simple Seeding
   if (process.env.NODE_ENV !== 'production') {
     const cats = await storage.getCategories();

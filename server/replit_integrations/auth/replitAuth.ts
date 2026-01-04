@@ -10,48 +10,70 @@ import { authStorage } from "./storage";
 
 const getOidcClient = memoize(
   async () => {
-    // Support either old REPL_ID env var or new provider-agnostic vars
-    const rawClientId = process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID;
-    const clientSecret = process.env.AUTH_CLIENT_SECRET ?? process.env.REPL_SECRET;
+    // Google-only configuration
+    const rawClientId = process.env.AUTH_CLIENT_ID;
+    const clientSecret = process.env.AUTH_CLIENT_SECRET;
 
     // Trim and validate client id to avoid whitespace-only values
     const clientId = typeof rawClientId === "string" ? rawClientId.trim() : rawClientId;
+
+    // In production we require both client id and secret to be present
+    if (process.env.NODE_ENV === 'production') {
+      if (!clientId) {
+        throw new Error('AUTH_CLIENT_ID must be set in production to enable Google auth');
+      }
+      if (!clientSecret) {
+        throw new Error('AUTH_CLIENT_SECRET must be set in production to enable Google auth');
+      }
+    }
+
+    // If no client id is configured (non-production), skip auth silently
     if (!clientId) {
-      console.warn('Auth client id is missing or empty after trimming; skipping OIDC discovery.');
+      console.warn('AUTH_CLIENT_ID not set; Google auth disabled in non-production');
       return null;
     }
 
     console.log(`Auth client id present (length=${clientId.length})`);
 
-    // Determine provider, prefer explicit AUTH_PROVIDER, otherwise infer
-    const provider = process.env.AUTH_PROVIDER ?? (process.env.REPL_ID ? "replit" : process.env.AUTH_CLIENT_ID ? "google" : "none");
-
-    const defaultIssuer = provider === "google" ? "https://accounts.google.com" : "https://replit.com/oidc";
-    const issuerUrl = new URL(process.env.ISSUER_URL ?? defaultIssuer);
+    const provider = 'google';
+    const issuerUrl = new URL(process.env.ISSUER_URL ?? 'https://accounts.google.com');
 
     console.log(`OIDC discovery using issuer: ${issuerUrl.href}`);
 
-    // Discover issuer metadata
-    const issuer = await client.discovery(issuerUrl);
+    // Discover issuer metadata (pass clientId as some providers expect it)
+    let issuer: any;
+    try {
+      issuer = await client.discovery(issuerUrl, clientId);
+    } catch (err: any) {
+      console.error('OIDC discovery failed:', err?.message ?? err, err?.stack ?? 'no stack');
+      // Return null to indicate auth setup can't proceed
+      return null;
+    }
 
     // Create a client instance for use with passport strategy
-    const oidcClient = new issuer.Client({
-      client_id: clientId,
-      client_secret: clientSecret,
-    } as any);
+    let oidcClient: any;
+    try {
+      oidcClient = new issuer.Client({
+        client_id: clientId,
+        client_secret: clientSecret,
+      } as any);
+    } catch (err: any) {
+      console.error('Failed to construct OIDC client:', err?.message ?? err, err?.stack ?? 'no stack');
+      return null;
+    }
 
     return { provider, issuer, client: oidcClient } as const;
   },
   { maxAge: 3600 * 1000 }
 );
 
-// Helper to check if auth is enabled (supports REPL_ID legacy var)
-export const isAuthEnabled = () => Boolean(process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID);
+// Helper to check if auth is enabled (Google-only)
+export const isAuthEnabled = () => Boolean(process.env.AUTH_CLIENT_ID && process.env.AUTH_CLIENT_ID.trim());
 
 // Returns a small auth status object for logging/health checks
 export const getAuthStatus = () => {
   const authEnabled = isAuthEnabled();
-  const provider = authEnabled ? (process.env.AUTH_PROVIDER ?? (process.env.REPL_ID ? 'replit' : 'google')) : null;
+  const provider = authEnabled ? 'google' : null;
   return { authEnabled, provider } as const;
 };
 
@@ -109,7 +131,12 @@ export async function setupAuth(app: Express) {
   const authStatus = getAuthStatus();
   console.log(`Auth: ${authStatus.authEnabled ? 'enabled' : 'disabled'}${authStatus.authEnabled ? ` (provider=${authStatus.provider})` : ''}`);
 
-  // If auth is not configured, skip setup
+  // In production require Google credentials
+  if (process.env.NODE_ENV === 'production' && !isAuthEnabled()) {
+    throw new Error('AUTH_CLIENT_ID must be set in production to enable Google auth');
+  }
+
+  // If not configured, skip setup (non-production)
   if (!isAuthEnabled()) {
     console.warn('Auth client id not set; skipping auth setup');
     return;
@@ -122,7 +149,7 @@ export async function setupAuth(app: Express) {
 
   const oidc = await getOidcClient();
   if (!oidc) {
-    console.warn('Auth client id not set; skipping auth setup');
+    console.warn('Failed to initialize OIDC client; skipping auth setup');
     return;
   }
   const { provider, client: oidcClient } = oidc;
@@ -163,15 +190,11 @@ export async function setupAuth(app: Express) {
 
   app.get("/api/login", (req, res, next) => {
     ensureStrategy(req.hostname);
-    // Add provider-specific auth params (Google needs access_type=offline to get refresh token)
-    const extra: any = { prompt: "login consent", scope: ["openid", "email", "profile", "offline_access"] };
-    if (process.env.AUTH_PROVIDER === "google") {
-      extra.access_type = "offline";
-      // Google recommends `prompt: consent` to ensure refresh token issuance for returning users
-      extra.prompt = "consent";
-    }
+    // Google-specific auth params
+    const extra: any = { access_type: "offline", prompt: "consent", scope: ["openid", "email", "profile", "offline_access"] };
     passport.authenticate(`auth:${req.hostname}`, extra)(req, res, next);
   });
+
 
   app.get("/api/callback", (req, res, next) => {
     ensureStrategy(req.hostname);
@@ -183,24 +206,11 @@ export async function setupAuth(app: Express) {
 
   app.get("/api/logout", (req, res) => {
     req.logout(() => {
-      // For providers that support end-session URL (Replit), attempt to call it.
-      // For Google, just redirect home (revocation could be added later).
-      try {
-        if (process.env.AUTH_PROVIDER === "replit" && (client as any).buildEndSessionUrl) {
-          const url = (client as any).buildEndSessionUrl(oidcClient as any, {
-            client_id: process.env.REPL_ID ?? process.env.AUTH_CLIENT_ID,
-            post_logout_redirect_uri: `${req.protocol}://${req.hostname}`,
-          });
-          if (!res.headersSent) res.redirect(url.href);
-          return;
-        }
-      } catch (e) {
-        // ignore and fallback to redirect home
-      }
-
+      // For Google, just redirect home (revocation can be implemented separately)
       if (!res.headersSent) res.redirect(`${req.protocol}://${req.hostname}`);
     });
   });
+
 }
 
 export const isAuthenticated: RequestHandler = async (req, res, next) => {
