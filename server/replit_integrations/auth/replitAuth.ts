@@ -11,19 +11,25 @@ import { authStorage } from "./storage";
 const getOidcClient = memoize(
   async () => {
     // Support either old REPL_ID env var or new provider-agnostic vars
-    const clientId = process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID;
+    const rawClientId = process.env.AUTH_CLIENT_ID ?? process.env.REPL_ID;
     const clientSecret = process.env.AUTH_CLIENT_SECRET ?? process.env.REPL_SECRET;
 
-    // If no client id is configured, don't run discovery — return null to indicate auth is disabled.
+    // Trim and validate client id to avoid whitespace-only values
+    const clientId = typeof rawClientId === "string" ? rawClientId.trim() : rawClientId;
     if (!clientId) {
+      console.warn('Auth client id is missing or empty after trimming; skipping OIDC discovery.');
       return null;
     }
+
+    console.log(`Auth client id present (length=${clientId.length})`);
 
     // Determine provider, prefer explicit AUTH_PROVIDER, otherwise infer
     const provider = process.env.AUTH_PROVIDER ?? (process.env.REPL_ID ? "replit" : process.env.AUTH_CLIENT_ID ? "google" : "none");
 
     const defaultIssuer = provider === "google" ? "https://accounts.google.com" : "https://replit.com/oidc";
     const issuerUrl = new URL(process.env.ISSUER_URL ?? defaultIssuer);
+
+    console.log(`OIDC discovery using issuer: ${issuerUrl.href}`);
 
     // Discover issuer metadata
     const issuer = await client.discovery(issuerUrl);
